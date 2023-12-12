@@ -5,15 +5,23 @@
 #![allow(clippy::extra_unused_lifetimes)]
 #![allow(clippy::unused_unit)]
 
-use super::move_resources::MoveResource;
 use crate::{
     models::{
-        fungible_asset_models::v2_fungible_asset_utils::FungibleAssetStore,
+        default_models::move_resources::MoveResource,
+        fungible_asset_models::v2_fungible_asset_utils::{
+            FungibleAssetMetadata, FungibleAssetStore, FungibleAssetSupply,
+        },
         token_models::collection_datas::{QUERY_RETRIES, QUERY_RETRY_DELAY_MS},
-        token_v2_models::v2_token_utils::{ObjectWithMetadata, TokenV2},
+        token_v2_models::v2_token_utils::{
+            AptosCollection, FixedSupply, PropertyMapModel, TokenV2, TransferEvent,
+            UnlimitedSupply, V2TokenResource,
+        },
     },
     schema::{current_objects, objects},
-    utils::database::PgPoolConnection,
+    utils::{
+        database::PgPoolConnection,
+        util::{deserialize_from_string, standardize_address},
+    },
 };
 use aptos_protos::transaction::v1::{DeleteResource, WriteResource};
 use bigdecimal::BigDecimal;
@@ -29,11 +37,24 @@ pub type CurrentObjectPK = String;
 /// Tracks all object related metadata in a hashmap for quick access (keyed on address of the object)
 pub type ObjectAggregatedDataMapping = HashMap<CurrentObjectPK, ObjectAggregatedData>;
 
+/// Index of the event so that we can write its inverse to the db as primary key (to avoid collisiona)
+pub type EventIndex = i64;
+
 /// This contains metadata for the object
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ObjectAggregatedData {
+    pub object: ObjectWithMetadata,
+    pub transfer_event: Option<(EventIndex, TransferEvent)>,
+    // Fungible asset structs
+    pub fungible_asset_metadata: Option<FungibleAssetMetadata>,
+    pub fungible_asset_supply: Option<FungibleAssetSupply>,
     pub fungible_asset_store: Option<FungibleAssetStore>,
+    // Token v2 structs
+    pub aptos_collection: Option<AptosCollection>,
+    pub fixed_supply: Option<FixedSupply>,
+    pub property_map: Option<PropertyMapModel>,
     pub token: Option<TokenV2>,
+    pub unlimited_supply: Option<UnlimitedSupply>,
 }
 
 #[derive(Clone, Debug, Deserialize, FieldCount, Identifiable, Insertable, Serialize)]
@@ -83,6 +104,56 @@ pub struct CurrentObjectQuery {
     pub is_fungible_asset: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ObjectCore {
+    pub allow_ungated_transfer: bool,
+    #[serde(deserialize_with = "deserialize_from_string")]
+    pub guid_creation_num: BigDecimal,
+    owner: String,
+}
+
+impl ObjectCore {
+    pub fn get_owner_address(&self) -> String {
+        standardize_address(&self.owner)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ObjectWithMetadata {
+    pub object_core: ObjectCore,
+    state_key_hash: String,
+}
+
+impl ObjectWithMetadata {
+    pub fn from_write_resource(
+        write_resource: &WriteResource,
+        txn_version: i64,
+    ) -> anyhow::Result<Option<Self>> {
+        let type_str = MoveResource::get_outer_type_from_resource(write_resource);
+        if !V2TokenResource::is_resource_supported(type_str.as_str()) {
+            return Ok(None);
+        }
+        if let V2TokenResource::ObjectCore(inner) = V2TokenResource::from_resource(
+            &type_str,
+            &serde_json::from_str(write_resource.data.as_str()).unwrap(),
+            txn_version,
+        )? {
+            Ok(Some(Self {
+                object_core: inner,
+                state_key_hash: standardize_address(
+                    hex::encode(write_resource.state_key_hash.as_slice()).as_str(),
+                ),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_state_key_hash(&self) -> String {
+        standardize_address(&self.state_key_hash)
+    }
+}
+
 impl Object {
     pub fn from_write_resource(
         write_resource: &WriteResource,
@@ -90,41 +161,33 @@ impl Object {
         write_set_change_index: i64,
         object_metadata_mapping: &ObjectAggregatedDataMapping,
     ) -> anyhow::Result<Option<(Self, CurrentObject)>> {
-        if let Some(inner) = ObjectWithMetadata::from_write_resource(write_resource, txn_version)? {
-            let resource = MoveResource::from_write_resource(
-                write_resource,
-                0, // Placeholder, this isn't used anyway
-                txn_version,
-                0, // Placeholder, this isn't used anyway
-            );
-            let object_core = &inner.object_core;
-            let object_metadata = object_metadata_mapping.get(&resource.address);
+        let address = standardize_address(&write_resource.address.to_string());
+        if let Some(object_aggregated_metadata) = object_metadata_mapping.get(&address) {
+            // do something
+            let object_with_metadata = object_aggregated_metadata.object.clone();
+            let object_core = object_with_metadata.object_core;
             Ok(Some((
                 Self {
                     transaction_version: txn_version,
                     write_set_change_index,
-                    object_address: resource.address.clone(),
+                    object_address: address.clone(),
                     owner_address: object_core.get_owner_address(),
-                    state_key_hash: resource.state_key_hash.clone(),
+                    state_key_hash: object_with_metadata.state_key_hash.clone(),
                     guid_creation_num: object_core.guid_creation_num.clone(),
                     allow_ungated_transfer: object_core.allow_ungated_transfer,
-                    is_token: object_metadata.map(|x| x.token.is_some()).unwrap_or(false),
-                    is_fungible_asset: object_metadata
-                        .map(|x| x.fungible_asset_store.is_some())
-                        .unwrap_or(false),
+                    is_token: object_aggregated_metadata.token.is_some(),
+                    is_fungible_asset: object_aggregated_metadata.fungible_asset_store.is_some(),
                     is_deleted: false,
                 },
                 CurrentObject {
-                    object_address: resource.address,
+                    object_address: address,
                     owner_address: object_core.get_owner_address(),
-                    state_key_hash: resource.state_key_hash,
+                    state_key_hash: object_with_metadata.state_key_hash,
                     allow_ungated_transfer: object_core.allow_ungated_transfer,
                     last_guid_creation_num: object_core.guid_creation_num.clone(),
                     last_transaction_version: txn_version,
-                    is_token: object_metadata.map(|x| x.token.is_some()).unwrap_or(false),
-                    is_fungible_asset: object_metadata
-                        .map(|x| x.fungible_asset_store.is_some())
-                        .unwrap_or(false),
+                    is_token: object_aggregated_metadata.token.is_some(),
+                    is_fungible_asset: object_aggregated_metadata.fungible_asset_store.is_some(),
                     is_deleted: false,
                 },
             )))

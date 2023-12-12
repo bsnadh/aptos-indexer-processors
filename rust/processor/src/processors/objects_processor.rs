@@ -4,10 +4,11 @@
 use super::{ProcessingResult, ProcessorName, ProcessorTrait};
 use crate::{
     models::{
-        default_models::v2_objects::{
-            CurrentObject, Object, ObjectAggregatedData, ObjectAggregatedDataMapping,
-        },
         fungible_asset_models::v2_fungible_asset_utils::FungibleAssetStore,
+        object_models::v2_objects::{
+            CurrentObject, Object, ObjectAggregatedData, ObjectAggregatedDataMapping,
+            ObjectWithMetadata,
+        },
         token_v2_models::v2_token_utils::TokenV2,
     },
     schema,
@@ -189,18 +190,35 @@ impl ProcessorTrait for ObjectsProcessor {
                 })
                 .changes;
 
-            // First pass to get all the structs related to the object
+            // First pass to get all the object cores
             for wsc in changes.iter() {
                 if let Change::WriteResource(wr) = wsc.change.as_ref().unwrap() {
                     let address = standardize_address(&wr.address.to_string());
-
-                    // Initialize mapping
-                    if object_metadata_helper.get(&address).is_none() {
+                    if let Some(object_with_metadata) =
+                        ObjectWithMetadata::from_write_resource(wr, txn_version).unwrap()
+                    {
+                        // Object core is the first struct that we need to get
                         object_metadata_helper.insert(address.clone(), ObjectAggregatedData {
+                            object: object_with_metadata,
                             token: None,
                             fungible_asset_store: None,
+                            // The following structs are unused in this processor
+                            fungible_asset_metadata: None,
+                            aptos_collection: None,
+                            fixed_supply: None,
+                            unlimited_supply: None,
+                            property_map: None,
+                            transfer_event: None,
+                            fungible_asset_supply: None,
                         });
                     }
+                }
+            }
+
+            // Second pass to get all other structs related to the object
+            for wsc in changes.iter() {
+                if let Change::WriteResource(wr) = wsc.change.as_ref().unwrap() {
+                    let address = standardize_address(&wr.address.to_string());
 
                     // Find structs related to object
                     if let Some(aggregated_data) = object_metadata_helper.get_mut(&address) {
@@ -219,7 +237,7 @@ impl ProcessorTrait for ObjectsProcessor {
                 }
             }
 
-            // Second pass to get all objects
+            // Third pass to construct the object data
             for (index, wsc) in changes.iter().enumerate() {
                 let index: i64 = index as i64;
                 match wsc.change.as_ref().unwrap() {
@@ -235,13 +253,6 @@ impl ProcessorTrait for ObjectsProcessor {
                             all_objects.push(object.clone());
                             all_current_objects
                                 .insert(object.object_address.clone(), current_object.clone());
-                            object_metadata_helper.insert(
-                                standardize_address(&inner.address.to_string()),
-                                ObjectAggregatedData {
-                                    token: None,
-                                    fungible_asset_store: None,
-                                },
-                            );
                         }
                     },
                     Change::DeleteResource(inner) => {
